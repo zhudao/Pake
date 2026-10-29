@@ -1,5 +1,4 @@
-import psl from 'psl';
-import isUrl from 'is-url';
+import * as psl from 'psl';
 
 // Extracts the domain from a given URL.
 export function getDomain(inputUrl: string): string | null {
@@ -32,10 +31,27 @@ export function appendProtocol(inputUrl: string): string {
 // Normalizes the URL by ensuring it has a protocol and is valid.
 export function normalizeUrl(urlToNormalize: string): string {
   const urlWithProtocol = appendProtocol(urlToNormalize);
-
-  if (isUrl(urlWithProtocol)) {
+  try {
+    new URL(urlWithProtocol);
     return urlWithProtocol;
-  } else {
-    throw new Error(`Your url "${urlWithProtocol}" is invalid`);
+  } catch (err) {
+    throw new Error(
+      `Your url "${urlWithProtocol}" is invalid: ${(err as Error).message}`,
+    );
   }
+}
+
+// Compiles a comma-separated domain list into a regex source for
+// internal_url_regex. Each domain is escaped and matched against the URL host
+// and its subdomains so path or query text cannot accidentally opt a link in.
+// Returns '' for empty input.
+export function safeDomainsToRegex(domains: string): string {
+  const escaped = domains
+    .split(',')
+    .map((domain) => domain.trim().toLowerCase())
+    .filter(Boolean)
+    .map((domain) => domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return escaped.length
+    ? `^https?:\\/\\/(?:[^/?#@]+\\.)*(?:${escaped.join('|')})(?::\\d+)?(?:[/?#]|$)`
+    : '';
 }

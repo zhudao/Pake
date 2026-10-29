@@ -1,86 +1,285 @@
-import chalk from 'chalk';
-import { program, Option } from 'commander';
 import log from 'loglevel';
+import chalk from 'chalk';
+import updateNotifier from 'update-notifier';
 import packageJson from '../package.json';
 import BuilderProvider from './builders/BuilderProvider';
-import { DEFAULT_PAKE_OPTIONS as DEFAULT } from './defaults';
-import { checkUpdateTips } from './helpers/updater';
 import handleInputOptions from './options/index';
-
+import { getCliProgram } from './helpers/cli-program';
+import { loadConfigFile } from './helpers/config-file';
+import { restoreLocalTree } from './helpers/merge';
+import {
+  beginBuildCancellation,
+  enterBuildWorkspace,
+  throwIfBuildCancelled,
+} from './utils/build-workspace';
+import { isPakeError, PakeError } from './utils/error';
+import { validateUrlInput, validateDownloadDirInput } from './utils/validate';
+import {
+  ERROR_EXIT_CODES,
+  PakeErrorCode,
+  enableMachineMode,
+  getCapturedWarnings,
+  printJsonResult,
+} from './utils/output';
 import { PakeCliOptions } from './types';
-import { validateNumberInput, validateUrlInput } from './utils/validate';
 
-const { green, yellow } = chalk;
-const logo = `${chalk.green(' ____       _')}
-${green('|  _ \\ __ _| | _____')}
-${green('| |_) / _` | |/ / _ \\')}
-${green('|  __/ (_| |   <  __/')}  ${yellow('https://github.com/tw93/pake')}
-${green('|_|   \\__,_|_|\\_\\___|  can turn any webpage into a desktop app with Rust.')}
-`;
+const program = getCliProgram();
 
-program.addHelpText('beforeAll', logo).usage(`[url] [options]`).showHelpAfterError();
+// Make commander throw instead of exiting so option/argument parse errors
+// honor the exit-code contract (2 = invalid input) and still emit the JSON
+// result object when --json was requested.
+program.exitOverride();
 
-program
-  .argument('[url]', 'The web URL you want to package', validateUrlInput)
-  .option('--name <string>', 'Application name')
-  .option('--icon <string>', 'Application icon', DEFAULT.icon)
-  .option('--width <number>', 'Window width', validateNumberInput, DEFAULT.width)
-  .option('--height <number>', 'Window height', validateNumberInput, DEFAULT.height)
-  .option('--use-local-file', 'Use local file packaging', DEFAULT.useLocalFile)
-  .option('--fullscreen', 'Start in full screen', DEFAULT.fullscreen)
-  .option('--hide-title-bar', 'Only for Mac, hide title bar', DEFAULT.hideTitleBar)
-  .option('--activation-shortcut <string>', 'Shortcut key to active App', DEFAULT.activationShortcut)
-  .option('--multi-arch', 'Only for Mac, supports both Intel and M1', DEFAULT.multiArch)
-  .option('--inject [injects...]', 'Injection of .js or .css Files', DEFAULT.inject)
-  .option('--debug', 'Debug build and more output', DEFAULT.debug)
-  .addOption(new Option('--user-agent <string>', 'Custom user agent').default(DEFAULT.userAgent).hideHelp())
-  .addOption(
-    new Option('--targets <string>', 'Only for Linux, option "deb" or "appimage"').default(DEFAULT.targets).hideHelp(),
-  )
-  .addOption(new Option('--always-on-top', 'Always on the top level').default(DEFAULT.alwaysOnTop).hideHelp())
-  .addOption(new Option('--dark-mode', 'Force Mac app to use dark mode').default(DEFAULT.darkMode).hideHelp())
-  .addOption(
-    new Option('--disabled-web-shortcuts', 'Disabled webPage shortcuts')
-      .default(DEFAULT.disabledWebShortcuts)
-      .hideHelp(),
-  )
-  .addOption(
-    new Option('--safe-domain [domains...]', 'Domains that Require Security Configuration')
-      .default(DEFAULT.safeDomain)
-      .hideHelp(),
-  )
-  .addOption(new Option('--show-system-tray', 'Show system tray in app').default(DEFAULT.showSystemTray).hideHelp())
-  .addOption(
-    new Option('--system-tray-icon <string>', 'Custom system tray icon').default(DEFAULT.systemTrayIcon).hideHelp(),
-  )
-  .addOption(
-    new Option('--installer-language <string>', 'Installer language').default(DEFAULT.installerLanguage).hideHelp(),
-  )
-  .version(packageJson.version, '-v, --version', 'Output the current version')
-  .action(async (url: string, options: PakeCliOptions) => {
-    await checkUpdateTips();
+function isCommanderExit(
+  error: unknown,
+): error is { code: string; exitCode: number; message: string } {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    typeof (error as { code?: unknown }).code === 'string' &&
+    (error as { code: string }).code.startsWith('commander.')
+  );
+}
+
+// Which stage the failure happened in decides the default error code; a
+// PakeError carrying an explicit code always wins over the phase default.
+type BuildPhase = 'input' | 'prepare' | 'build';
+
+const PHASE_ERROR_CODES: Record<BuildPhase, PakeErrorCode> = {
+  input: 'INVALID_INPUT',
+  prepare: 'ENV_MISSING',
+  build: 'BUILD_FAILED',
+};
+
+function classifyError(
+  error: unknown,
+  phase: BuildPhase,
+): { code: PakeErrorCode; message: string; hint: string | null } {
+  if (isPakeError(error)) {
+    return {
+      code: error.code ?? PHASE_ERROR_CODES[phase],
+      message: error.message,
+      hint: error.hint ?? null,
+    };
+  }
+  if (error instanceof Error) {
+    return {
+      code: PHASE_ERROR_CODES[phase],
+      message: error.message,
+      hint: null,
+    };
+  }
+  return {
+    code: 'UNEXPECTED',
+    message: `Unexpected error: ${String(error)}`,
+    hint: null,
+  };
+}
+
+async function checkUpdateTips() {
+  updateNotifier({ pkg: packageJson, updateCheckInterval: 1000 * 60 }).notify({
+    isGlobal: true,
+  });
+}
+
+program.action(async (urlArg: string, options: PakeCliOptions) => {
+  const jsonMode = Boolean(options.json);
+  if (jsonMode) {
+    enableMachineMode();
+  }
+
+  let phase: BuildPhase = 'input';
+  let appName: string | null = null;
+  let url = urlArg;
+  let leaveWorkspace: (() => Promise<void>) | undefined;
+  let endCancellation: (() => void) | undefined;
+
+  try {
+    // Heal a dist_bak stranded by an earlier crashed local-input run before
+    // building, or this build would embed that run's staged files.
+    restoreLocalTree();
+
+    if (!jsonMode) {
+      await checkUpdateTips();
+    }
+
+    // Config file fills in whatever the command line did not set explicitly:
+    // CLI flag > config field > built-in default.
+    if (options.config) {
+      const validKeys = new Set(
+        program.options.map((option) => option.attributeName()),
+      );
+      const loaded = await loadConfigFile(options.config, validKeys);
+      for (const [key, value] of Object.entries(loaded.options)) {
+        if (program.getOptionValueSource(key) !== 'cli') {
+          (options as unknown as Record<string, unknown>)[key] = value;
+        }
+      }
+      if (!url && loaded.url) {
+        try {
+          url = validateUrlInput(loaded.url);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new PakeError(`Invalid "url" in config file: ${detail}`, {
+            code: 'INVALID_INPUT',
+          });
+        }
+      }
+    }
+
+    validateDownloadDirInput(options.downloadDir);
 
     if (!url) {
-      program.outputHelp(str => {
-        return str
-          .split('\n')
-          .filter(line => !/((-h,|--help)|((-v|-V),|--version))\s+.+$/.test(line))
-          .join('\n');
+      if (jsonMode) {
+        throw new PakeError('No URL or local path to package.', {
+          code: 'INVALID_INPUT',
+          hint: 'Pass a URL/path argument or a config file with a "url" field.',
+        });
+      }
+      program.help({
+        error: false,
       });
-      process.exit(0);
+      return;
     }
 
     log.setDefaultLevel('info');
+    log.setLevel('info');
     if (options.debug) {
       log.setLevel('debug');
     }
 
+    endCancellation = beginBuildCancellation();
+    phase = 'prepare';
+    const workspace = await enterBuildWorkspace();
+    leaveWorkspace = workspace;
+    phase = 'input';
     const appOptions = await handleInputOptions(options, url);
-    log.debug('PakeAppOptions', appOptions);
+    throwIfBuildCancelled();
+    appName = appOptions.name ?? null;
 
     const builder = BuilderProvider.create(appOptions);
+    phase = 'prepare';
     await builder.prepare();
+    throwIfBuildCancelled();
+    phase = 'build';
+    await workspace.lockCache();
+    throwIfBuildCancelled();
     await builder.build(url);
-  });
+    throwIfBuildCancelled();
 
-program.parse();
+    await leaveWorkspace();
+    leaveWorkspace = undefined;
+
+    if (jsonMode) {
+      printJsonResult({
+        ok: true,
+        name: appName,
+        platform: process.platform,
+        arch: builder.getReportArch(),
+        outputs: builder.getArtifacts(),
+        warnings: getCapturedWarnings(),
+        error: null,
+      });
+    }
+  } catch (error) {
+    // program.help() and --help/--version throw under exitOverride with
+    // exitCode 0; a clean commander exit is not a failure.
+    if (isCommanderExit(error) && error.exitCode === 0) {
+      return;
+    }
+
+    if (leaveWorkspace) {
+      await leaveWorkspace();
+      leaveWorkspace = undefined;
+    }
+
+    const classified = classifyError(error, phase);
+
+    if (jsonMode) {
+      printJsonResult({
+        ok: false,
+        name: appName,
+        platform: process.platform,
+        arch: null,
+        outputs: [],
+        warnings: getCapturedWarnings(),
+        error: classified,
+      });
+    } else if (isPakeError(error)) {
+      console.error(chalk.red(classified.message));
+      if (classified.hint) {
+        console.error(chalk.yellow(`✼ ${classified.hint}`));
+      }
+    } else if (error instanceof Error) {
+      console.error(chalk.red(`✕ ${error.message}`));
+      if (options?.debug && error.stack) {
+        console.error(chalk.gray(error.stack));
+      }
+    } else {
+      console.error(chalk.red(`✕ Unexpected error: ${String(error)}`));
+    }
+
+    // exitCode + natural exit instead of process.exit: lets the finally
+    // restore run and guarantees the JSON result is flushed on piped stdout.
+    process.exitCode = ERROR_EXIT_CODES[classified.code];
+  } finally {
+    // Failed builds discard their private inputs without touching the package.
+    try {
+      if (leaveWorkspace) await leaveWorkspace();
+    } finally {
+      endCancellation?.();
+    }
+  }
+});
+
+program.parseAsync().catch((error: unknown) => {
+  if (isCommanderExit(error)) {
+    // --help / --version and friends exit clean; commander already printed.
+    if (error.exitCode === 0) {
+      return;
+    }
+    // Parse errors (unknown option, invalid argument, missing value) are
+    // invalid input. Commander already printed the message to stderr; in
+    // json mode also emit the machine-readable result on stdout.
+    //
+    // Excess operands are almost always an unquoted value: `--name Google
+    // Translate` leaves `Translate` as a second operand, and commander's
+    // "too many arguments" names neither --name nor quoting, so the shape
+    // reads as "names with spaces are unsupported" (#1378).
+    const excessArguments = error.code === 'commander.excessArguments';
+    // Name the operand rather than asserting why it is there. Unquoting is the
+    // usual cause, but two bare URLs produce the same error and the quoting
+    // advice would be wrong for them.
+    const extraOperand = excessArguments ? program.args.slice(1)[0] : undefined;
+    const hint = excessArguments
+      ? `Unexpected extra argument${extraOperand ? ` "${extraOperand}"` : ''}. A value containing spaces must be quoted, for example --name "Google Translate".`
+      : 'Run pake --help for the accepted options.';
+    if (process.argv.includes('--json')) {
+      printJsonResult({
+        ok: false,
+        name: null,
+        platform: process.platform,
+        arch: null,
+        outputs: [],
+        warnings: [],
+        error: {
+          code: 'INVALID_INPUT',
+          message: error.message.trim(),
+          hint,
+        },
+      });
+    } else if (excessArguments) {
+      // Commander has already written its message and the full help, so this
+      // lands last, which is where the eye goes after a wall of help text.
+      console.error(chalk.red(`\u2715 ${hint}`));
+    }
+    process.exitCode = ERROR_EXIT_CODES.INVALID_INPUT;
+    return;
+  }
+  if (error instanceof Error) {
+    console.error(chalk.red(`✕ ${error.message}`));
+  } else {
+    console.error(chalk.red(`✕ Unexpected error: ${String(error)}`));
+  }
+  process.exitCode = 1;
+});

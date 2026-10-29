@@ -5,9 +5,17 @@ import { fileURLToPath } from 'url';
 const currentModulePath = fileURLToPath(import.meta.url);
 
 // Resolve the parent directory of the current module
-export const npmDirectory = path.join(path.dirname(currentModulePath), '..');
+export const packageDirectory = path.join(
+  path.dirname(currentModulePath),
+  '..',
+);
+export let npmDirectory = packageDirectory;
 
-export const tauriConfigDirectory =
-  process.env.NODE_ENV === 'development'
-    ? path.join(npmDirectory, 'src-tauri', '.pake')
-    : path.join(npmDirectory, 'src-tauri');
+export let tauriConfigDirectory = path.join(npmDirectory, 'src-tauri', '.pake');
+
+// A CLI invocation owns one build workspace. Keep template resolution separate
+// from generated paths so packaging never rewrites the installed package.
+export function setBuildDirectory(directory: string): void {
+  npmDirectory = directory;
+  tauriConfigDirectory = path.join(directory, 'src-tauri', '.pake');
+}
